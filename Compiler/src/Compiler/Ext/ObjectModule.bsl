@@ -135,7 +135,6 @@ Procedure VisitModule(Module, M = Undefined, Counters = Undefined) Export
 	
 	// Генерация кода тела модуля.
 	
-	// Установка перехода к телу модуля в качестве первой исполняемой инструкции.
 	Result.Add("// Module body");
 	
 	// Локальные переменные модуля имеют относительную адресацию.
