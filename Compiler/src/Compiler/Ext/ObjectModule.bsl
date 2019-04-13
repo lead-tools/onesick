@@ -1,25 +1,45 @@
 ﻿
 // Транслятор
 
-Var Result;        // array
-Var OffsetMap;     // map[number]
-Var CallIndex;     // number
-Var ItemsCount;    // map[Sign](number)
-Var CurrentCaller;
-Var CallSites;     // map[Sign](array)
+// Результат трансляции.
+Var Result; // array
 
-Var LeftFP;        // number const
+// Относительные адреса переменных и параметров.
+// Абсолютные адреса методов хранятся тоже тут (:
+Var OffsetMap; // map[Decl](number)
 
-Var LastIsReturn;  // boolean
+// Количество вызовов функций в последних разобранных выражениях.
+// Нужно для вычисления адреса результата функции и для уборки мусора.
+Var CallsCount; // number
 
-Var Labels;        // map[string](number)
-Var GotoList;      // map[string]array(number)
+// Суммарное количество параметров и переменных в методе.
+Var ItemsCount; // map[Sign](number)
 
+// Текущий метод (или модуль, при генерации тела модуля)
+Var CurrentCaller; // Sign, Module
+
+// Точки вызова метода.
+// Нужны для отложенной генерации вызовов, так как порядок
+// объявления методов произвольный и не все адреса известны сразу.
+Var CallSites; // map[Sign](array)
+
+// Признак что последней инструкцией был Возврат.
+Var LastIsReturn; // boolean
+
+// Вложенные области видимости для циклов.
+// Нужны для определения адресов переходов в инструкциях Прервать и Продолжить.
+Var LoopScope; // structure
+
+// Списки для отложенной генерации переходов по меткам.
+// Будет переделано, т.к. нужны области видимости для контроля семантики.
+Var Labels;   // map[string](number)
+Var GotoList; // map[string]array(number)
+
+// Перечисления
 Var Nodes;         // enum
 Var Tokens;        // enum
+Var Directives;    // enum
 Var Operators;     // structure as map[one of Tokens](string)
-
-Var Scope;         // structure
 
 Procedure Init(BSLParser) Export	
 	Operators = New Structure(
@@ -28,14 +48,14 @@ Procedure Init(BSLParser) Export
 	);
 	Nodes = BSLParser.Nodes();
 	Tokens = BSLParser.Tokens();
+	Directives = BSLParser.Directives();
 	Result = New Array;
 	OffsetMap = New Map;
-	CallIndex = 0;
+	CallsCount = 0;
 	ItemsCount = New Map;
 	CallSites = New Map;
 	Labels = New Map;
 	GotoList = New Map;
-	LeftFP = 2;
 	LastIsReturn = False;
 EndProcedure // Init()
 
@@ -50,13 +70,13 @@ Function Result() Export
 	Return Result;
 EndFunction // Refult()
 
-Procedure OpenScope()
-	Scope = New Structure("Outer, Break, Continue", Scope, New Array, New Array);
-EndProcedure // OpenScope()
+Procedure OpenLoopScope()
+	LoopScope = New Structure("Outer, Break, Continue", LoopScope, New Array, New Array);
+EndProcedure // OpenLoopScope()
 
-Procedure CloseScope()
-	Scope = Scope.Outer;
-EndProcedure // CloseScope()
+Procedure CloseLoopScope()
+	LoopScope = LoopScope.Outer;
+EndProcedure // CloseLoopScope()
 
 Procedure VisitModule(Module, M = Undefined, Counters = Undefined) Export
 	
@@ -65,7 +85,7 @@ Procedure VisitModule(Module, M = Undefined, Counters = Undefined) Export
 	Result.Add(); // Переход к телу модуля (заполняется отложенно).
 	
 	// Первый проход: назначение адресов переменным и параметрам.
-	                                                              
+	
 	For Each Decl In Module.Decls Do
 		
 		Type = Decl.Type;
@@ -75,8 +95,10 @@ Procedure VisitModule(Module, M = Undefined, Counters = Undefined) Export
 			// Переменные модуля имеют абсолютную адресацию.
 			
 			For Each VarDecl In Decl.List Do
-				Address = Address + 1;
-				OffsetMap[VarDecl] = Address;
+				If VarDecl.Directive = Directives.AtClient Then
+					Address = Address + 1;
+					OffsetMap[VarDecl] = Address;
+				EndIf; 
 			EndDo;
 			
 		ElsIf Type = Nodes.MethodDecl Then 
@@ -114,9 +136,7 @@ Procedure VisitModule(Module, M = Undefined, Counters = Undefined) Export
 	
 	For Each Decl In Module.Decls Do
 		
-		Type = Decl.Type;
-		
-		If Type = Nodes.MethodDecl Then 
+		If Decl.Type = Nodes.MethodDecl Then 
 			
 			Sign = Decl.Sign;
 			OffsetMap[Sign] = Result.Count();
@@ -125,7 +145,7 @@ Procedure VisitModule(Module, M = Undefined, Counters = Undefined) Export
 			
 			VisitStatements(Decl.Body);
 			
-			If Not LastIsReturn Then
+			If Not LastIsReturn Then // если последней инструкцией был возврат, то эпилог уже сгенерирован
 				EmitEpilog();
 			EndIf; 
 			
@@ -180,13 +200,14 @@ EndProcedure // VisitStatements()
 
 Procedure GarbageCollectionAfterCalls(Buffer)
 	// После вызовов функций нужно чистить результаты, чтобы избежать утечки памяти.
-	If CallIndex > 0 Then
-		Buffer.Add(StrTemplate("For _=SP-%1 To SP Do M[_]=Undefined EndDo;SP=SP-%2; // GC after function calls", CallIndex-1, CallIndex));
-		CallIndex = 0;
+	If CallsCount > 0 Then
+		Buffer.Add(StrTemplate("For _=SP-%1 To SP Do M[_]=Undefined EndDo;SP=SP-%2; // GC after function calls", CallsCount-1, CallsCount));
+		CallsCount = 0;
 	EndIf;
 EndProcedure 
 
 Procedure EmitEpilog()
+	// Эпилог вызова метода. Чистка мусора и восстановление регистров.
 	Result.Add("For _=FP+1 To SP Do M[_]=Undefined EndDo;SP=FP-1;FP=M[FP];IP=M[SP];SP=SP-1; // GC, Restore FP, Return, del ret addr");
 EndProcedure 
 
@@ -196,34 +217,34 @@ Procedure VisitStmt(Stmt)
 	Type = Stmt.Type;	
 	LastIsReturn = False;
 	If Type = Nodes.AssignStmt Then
-        VisitAssignStmt(Stmt);
-    ElsIf Type = Nodes.ReturnStmt Then
-        VisitReturnStmt(Stmt);
+		VisitAssignStmt(Stmt);
+	ElsIf Type = Nodes.ReturnStmt Then
+		VisitReturnStmt(Stmt);
 		LastIsReturn = True;
-    ElsIf Type = Nodes.BreakStmt Then
-        VisitBreakStmt(Stmt);
-    ElsIf Type = Nodes.ContinueStmt Then
-        VisitContinueStmt(Stmt);
-    ElsIf Type = Nodes.RaiseStmt Then
-        VisitRaiseStmt(Stmt);
-    ElsIf Type = Nodes.ExecuteStmt Then
-        VisitExecuteStmt(Stmt);
-    ElsIf Type = Nodes.CallStmt Then
-        VisitCallStmt(Stmt);
-    ElsIf Type = Nodes.IfStmt Then
-        VisitIfStmt(Stmt);
-    ElsIf Type = Nodes.WhileStmt Then
-        VisitWhileStmt(Stmt);
-    ElsIf Type = Nodes.ForStmt Then
-        VisitForStmt(Stmt);
-    ElsIf Type = Nodes.ForEachStmt Then
-        VisitForEachStmt(Stmt);
-    ElsIf Type = Nodes.TryStmt Then
-        VisitTryStmt(Stmt);
-    ElsIf Type = Nodes.GotoStmt Then
-        VisitGotoStmt(Stmt);
-    ElsIf Type = Nodes.LabelStmt Then
-        VisitLabelStmt(Stmt);
+	ElsIf Type = Nodes.BreakStmt Then
+		VisitBreakStmt(Stmt);
+	ElsIf Type = Nodes.ContinueStmt Then
+		VisitContinueStmt(Stmt);
+	ElsIf Type = Nodes.RaiseStmt Then
+		VisitRaiseStmt(Stmt);
+	ElsIf Type = Nodes.ExecuteStmt Then
+		VisitExecuteStmt(Stmt);
+	ElsIf Type = Nodes.CallStmt Then
+		VisitCallStmt(Stmt);
+	ElsIf Type = Nodes.IfStmt Then
+		VisitIfStmt(Stmt);
+	ElsIf Type = Nodes.WhileStmt Then
+		VisitWhileStmt(Stmt);
+	ElsIf Type = Nodes.ForStmt Then
+		VisitForStmt(Stmt);
+	ElsIf Type = Nodes.ForEachStmt Then
+		VisitForEachStmt(Stmt);
+	ElsIf Type = Nodes.TryStmt Then
+		VisitTryStmt(Stmt);
+	ElsIf Type = Nodes.GotoStmt Then
+		VisitGotoStmt(Stmt);
+	ElsIf Type = Nodes.LabelStmt Then
+		VisitLabelStmt(Stmt);
 	Else
 		// error
 	EndIf;
@@ -239,7 +260,7 @@ Procedure VisitAssignStmt(AssignStmt)
 	Left = StrConcat(Buffer);
 	
 	Buffer.Clear();
-	CallIndex = 0;
+	CallsCount = 0;
 	VisitExpr(AssignStmt.Right, Buffer);
 	Right = StrConcat(Buffer);
 	
@@ -253,7 +274,7 @@ Procedure VisitCallStmt(CallStmt)
 	Var Buffer;
 	
 	Buffer = New Array;
-	CallIndex = 0;
+	CallsCount = 0;
 	VisitIdentExpr(CallStmt.Ident, Buffer);
 	If CallStmt.Ident.Head.Decl = Undefined
 		Or CallStmt.Ident.Args = Undefined Then
@@ -271,10 +292,10 @@ Procedure VisitReturnStmt(ReturnStmt)
 	If ReturnStmt.Expr <> Undefined Then
 		
 		Buffer = New Array;
-		CallIndex = 0;
+		CallsCount = 0;
 		VisitExpr(ReturnStmt.Expr, Buffer);
 		Right = StrConcat(Buffer);
-		Result.Add(StrTemplate("M[FP-%1]=%2; // Return", LeftFP, Right));
+		Result.Add(StrTemplate("M[FP-2]=%1; // Return", Right));
 		
 		GarbageCollectionAfterCalls(Result);
 		
@@ -287,14 +308,14 @@ EndProcedure // VisitReturnStmt()
 Procedure VisitBreakStmt(BreakStmt)
 	
 	Result.Add(); // Переход на конец цикла (заполняется отложенно).
-	Scope.Break.Add(Result.UBound());
+	LoopScope.Break.Add(Result.UBound());
 	
 EndProcedure // VisitBreakStmt()
 
 Procedure VisitContinueStmt(ContinueStmt)
 	
 	Result.Add(); // Переход на начало цикла (заполняется отложенно).
-	Scope.Continue.Add(Result.UBound());
+	LoopScope.Continue.Add(Result.UBound());
 	
 EndProcedure // VisitContinueStmt()
 
@@ -324,17 +345,17 @@ EndProcedure // VisitExecuteStmt()
 
 Procedure VisitIfStmt(IfStmt)
 	
-	CallIndex = 0;
+	CallsCount = 0;
 	
 	Ends = New Array;
 	List = New Array;
-		
+	
 	Buffer = New Array;	
 	VisitExpr(IfStmt.Cond, Buffer);
 	Result.Add(StrConcat(Buffer)); // deferred	
-	Item = New Structure("Addr, CallIndex, Goto", Result.UBound(), CallIndex);
+	Item = New Structure("Addr, CallIndex, Goto", Result.UBound(), CallsCount);
 	List.Add(Item);
-		
+	
 	GarbageCollectionAfterCalls(Result);
 	
 	VisitStatements(IfStmt.Then);	
@@ -351,7 +372,7 @@ Procedure VisitIfStmt(IfStmt)
 			Buffer = New Array;
 			VisitExpr(ElsIfStmt.Cond, Buffer);			
 			Result.Add(StrConcat(Buffer)); // deferred
-			Item = New Structure("Addr, CallIndex, Goto", Result.UBound(), CallIndex);
+			Item = New Structure("Addr, CallIndex, Goto", Result.UBound(), CallsCount);
 			List.Add(Item); 
 			
 			GarbageCollectionAfterCalls(Result);
@@ -389,9 +410,9 @@ EndProcedure // VisitIfStmt()
 
 Procedure VisitWhileStmt(WhileStmt)
 	
-	OpenScope();
+	OpenLoopScope();
 	
-	CallIndex = 0;
+	CallsCount = 0;
 	
 	HeadAddr = Result.UBound();
 	
@@ -407,25 +428,25 @@ Procedure VisitWhileStmt(WhileStmt)
 	Result.Add(StrTemplate("IP=%1;", Fmt(HeadAddr)));
 	Result[ExprAddr] = StrTemplate("If Not (%1) Then IP=%2 EndIf;", StrConcat(Buffer), Fmt(Result.UBound()));
 	
-	For Each Addr In Scope.Break Do
+	For Each Addr In LoopScope.Break Do
 		Result[Addr] = StrTemplate("IP=%1;", Fmt(Result.UBound()));
 	EndDo;
-	Scope.Break.Clear();
+	LoopScope.Break.Clear();
 	
-	For Each Addr In Scope.Continue Do
+	For Each Addr In LoopScope.Continue Do
 		Result[Addr] = StrTemplate("IP=%1;", Fmt(HeadAddr));
 	EndDo;
-	Scope.Continue.Clear();
+	LoopScope.Continue.Clear();
 	
-	CloseScope();
+	CloseLoopScope();
 	
 EndProcedure // VisitWhileStmt()
 
 Procedure VisitForStmt(ForStmt)
 	
-	OpenScope();
+	OpenLoopScope();
 	
-	CallIndex = 0;
+	CallsCount = 0;
 	
 	Buffer = New Array;
 	VisitIdentExpr(ForStmt.Ident, Buffer);
@@ -450,25 +471,25 @@ Procedure VisitForStmt(ForStmt)
 	Result.Add(StrTemplate("%1=%1+1;IP=%2;", Left, HeadAddr));
 	Result[ExprAddr] = StrTemplate("If %1>%2 Then IP=%3 EndIf;", Left, StrConcat(Buffer), Fmt(Result.UBound()));
 	
-	For Each Addr In Scope.Break Do
+	For Each Addr In LoopScope.Break Do
 		Result[Addr] = StrTemplate("IP=%1;", Fmt(Result.UBound()));
 	EndDo;
-	Scope.Break.Clear();
+	LoopScope.Break.Clear();
 	
-	For Each Addr In Scope.Continue Do
+	For Each Addr In LoopScope.Continue Do
 		Result[Addr] = StrTemplate("IP=%1;", Fmt(HeadAddr));
 	EndDo;
-	Scope.Continue.Clear();
+	LoopScope.Continue.Clear();
 	
-	CloseScope();
+	CloseLoopScope();
 	
 EndProcedure // VisitForStmt()
 
 Procedure VisitForEachStmt(ForEachStmt)
 	
-	OpenScope();
+	OpenLoopScope();
 	
-	CallIndex = 0;
+	CallsCount = 0;
 	
 	Buffer = New Array;
 	VisitIdentExpr(ForEachStmt.Ident, Buffer);
@@ -489,19 +510,19 @@ Procedure VisitForEachStmt(ForEachStmt)
 	Result.Add(StrTemplate("IP=%1;", HeadAddr));
 	Result[ExprAddr] = StrTemplate("If M[SP]>M[SP-1] Then IP=%1 Else %2=M[SP-2][M[SP]]; M[SP]=M[SP]+1 EndIf;", Fmt(Result.UBound()), Left);
 	
-	For Each Addr In Scope.Break Do
+	For Each Addr In LoopScope.Break Do
 		Result[Addr] = StrTemplate("IP=%1;", Fmt(Result.UBound()));
 	EndDo;
-	Scope.Break.Clear();
+	LoopScope.Break.Clear();
 	
-	For Each Addr In Scope.Continue Do
+	For Each Addr In LoopScope.Continue Do
 		Result[Addr] = StrTemplate("IP=%1;", Fmt(HeadAddr));
 	EndDo;
-	Scope.Continue.Clear();
-		
+	LoopScope.Continue.Clear();
+	
 	Result.Add("SP=SP-3;For _=SP+1 TO SP+3 Do M[_]=Undefined EndDo;");
 	
-	CloseScope();
+	CloseLoopScope();
 	
 EndProcedure // VisitForEachStmt()
 
@@ -542,26 +563,26 @@ EndProcedure // VisitLabelStmt()
 #Region VisitExpr
 
 Procedure VisitExpr(Expr, Buffer)
-    Var Type, Hook;
+	Var Type, Hook;
 	Type = Expr.Type;
 	If Type = Nodes.BasicLitExpr Then
-        VisitBasicLitExpr(Expr, Buffer);
-    ElsIf Type = Nodes.IdentExpr Then
-        VisitIdentExpr(Expr, Buffer);
-    ElsIf Type = Nodes.UnaryExpr Then
-        VisitUnaryExpr(Expr, Buffer);
-    ElsIf Type = Nodes.BinaryExpr Then
-        VisitBinaryExpr(Expr, Buffer);
-    ElsIf Type = Nodes.NewExpr Then
-        VisitNewExpr(Expr, Buffer);
-    ElsIf Type = Nodes.TernaryExpr Then
-        VisitTernaryExpr(Expr, Buffer);
-    ElsIf Type = Nodes.ParenExpr Then
-        VisitParenExpr(Expr, Buffer);
-    ElsIf Type = Nodes.NotExpr Then
-        VisitNotExpr(Expr, Buffer);
-    ElsIf Type = Nodes.StringExpr Then
-        VisitStringExpr(Expr, Buffer);
+		VisitBasicLitExpr(Expr, Buffer);
+	ElsIf Type = Nodes.IdentExpr Then
+		VisitIdentExpr(Expr, Buffer);
+	ElsIf Type = Nodes.UnaryExpr Then
+		VisitUnaryExpr(Expr, Buffer);
+	ElsIf Type = Nodes.BinaryExpr Then
+		VisitBinaryExpr(Expr, Buffer);
+	ElsIf Type = Nodes.NewExpr Then
+		VisitNewExpr(Expr, Buffer);
+	ElsIf Type = Nodes.TernaryExpr Then
+		VisitTernaryExpr(Expr, Buffer);
+	ElsIf Type = Nodes.ParenExpr Then
+		VisitParenExpr(Expr, Buffer);
+	ElsIf Type = Nodes.NotExpr Then
+		VisitNotExpr(Expr, Buffer);
+	ElsIf Type = Nodes.StringExpr Then
+		VisitStringExpr(Expr, Buffer);
 	EndIf;
 EndProcedure // VisitExpr()
 
@@ -597,7 +618,7 @@ Procedure VisitIdentExpr(IdentExpr, Buffer)
 	Decl = IdentExpr.Head.Decl;
 	
 	If IdentExpr.Args <> Undefined Then		
-			
+		
 		GenerateCall(IdentExpr, Buffer);
 		
 	ElsIf Decl = Undefined Then
@@ -616,7 +637,7 @@ Procedure VisitIdentExpr(IdentExpr, Buffer)
 		EndIf; 
 		
 	EndIf;
-		
+	
 	VisitTail(IdentExpr.Tail, Buffer);
 	
 EndProcedure // VisitIdentExpr()
@@ -646,7 +667,7 @@ Procedure GenerateCall(IdentExpr, Buffer)
 		
 		// буфер для пролога
 		Prolog = New Array;
-				
+		
 		// генерация пролога {{
 		
 		// кадр вызова:
@@ -674,7 +695,7 @@ Procedure GenerateCall(IdentExpr, Buffer)
 			If Index < TotalArgs Then
 				ArgExpr = Args[Index];
 			Else // аргумент в конце опущен (TODO: нужно генерить ошибку если он не имеет значения по умолчанию)
-			    ArgExpr = Undefined;
+				ArgExpr = Undefined;
 			EndIf;
 			
 			If ArgExpr = Undefined Then
@@ -720,8 +741,8 @@ Procedure GenerateCall(IdentExpr, Buffer)
 		
 		// нужно вернуть в выражение результат вызова функции
 		// адрес результата берется как смещение относительно FP вызывающего метода
-		CallIndex = CallIndex + 1;
-		Buffer.Add(StrTemplate("M[FP+%1]", ItemsCount[CurrentCaller] + CallIndex));
+		CallsCount = CallsCount + 1;
+		Buffer.Add(StrTemplate("M[FP+%1]", ItemsCount[CurrentCaller] + CallsCount));
 		
 	EndIf; 
 	
